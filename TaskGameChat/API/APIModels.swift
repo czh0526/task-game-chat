@@ -251,6 +251,24 @@ struct Message: Decodable, Identifiable, Sendable, Hashable {
     var attachmentRef: String
     var createdAt: String
 
+    init(
+        id: String,
+        chatId: String,
+        senderId: String,
+        type: String,
+        text: String,
+        attachmentRef: String,
+        createdAt: String
+    ) {
+        self.id = id
+        self.chatId = chatId
+        self.senderId = senderId
+        self.type = type
+        self.text = text
+        self.attachmentRef = attachmentRef
+        self.createdAt = createdAt
+    }
+
     enum CodingKeys: String, CodingKey {
         case id
         case chatId = "chat_id"
@@ -281,6 +299,15 @@ struct MessageList: Decodable, Sendable {
         case items
         case nextCursor = "next_cursor"
     }
+}
+
+/// One full oldest-first walk of a thread, plus the cursor a live update should reuse.
+struct MessageHistory: Sendable {
+    var messages: [Message]
+    var truncated: Bool
+    /// Pass this to the next tail read. `nil` re-reads the first page.
+    /// When the walk stopped early, this is the first page that was not loaded.
+    var tailCursor: String?
 }
 
 struct ChatRead: Decodable, Sendable {

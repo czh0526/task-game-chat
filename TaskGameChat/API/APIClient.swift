@@ -154,22 +154,17 @@ struct APIClient: Sendable {
     }
 
     /// Walks oldest-first pages, matching the web client cap of 20 × 100.
-    func messageHistory(chatId: String) async throws -> (messages: [Message], truncated: Bool) {
-        var messages: [Message] = []
+    /// Live updates should not call this again; reuse `tailCursor` with `listMessages`.
+    func messageHistory(chatId: String) async throws -> MessageHistory {
+        var pages: [MessageList] = []
         var cursor: String?
-        var truncated = false
-        let maxPages = 20
-        for page in 0..<maxPages {
+        for _ in 0..<20 {
             let list = try await listMessages(chatId: chatId, limit: 100, cursor: cursor)
-            messages.append(contentsOf: list.items)
-            guard let next = list.nextCursor, !next.isEmpty else {
-                truncated = false
-                break
-            }
+            pages.append(list)
+            guard let next = list.nextCursor, !next.isEmpty else { break }
             cursor = next
-            truncated = page == maxPages - 1
         }
-        return (messages, truncated)
+        return MessageCursor.fold(pages)
     }
 
     /// `POST /v1/chats/{chatId}/messages` → 201. `type` is `text` or `sticker`.
