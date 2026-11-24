@@ -52,6 +52,12 @@ enum DisplayName {
 }
 
 enum ChatTime {
+    static func stamp(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: date)
+    }
+
     static func format(_ raw: String) -> String {
         guard let date = parse(raw) else { return raw }
         let formatter = DateFormatter()

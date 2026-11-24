@@ -32,9 +32,9 @@ API 如果跑在局域网另一台机器上，把地址改成那台机器的 IP�
 - 邮箱 + 密码注册、登录。密码按服务端规则：至少 8 个 Unicode 字符，最多 72 字节。邮箱会转成小写。
 - 好友列表，包含个人分组、未读角标、收到和发出的申请。可以加好友、接受、拒绝、撤回、解除好友、建分组、改名、删除、把好友移进分组。
 - 点一个好友会 `POST /v1/chats` `{ "type": "direct", "user_id" }`。已经有的一对一会话会返回同一条，状态仍是 201。
-- 消息列表按接口从旧到新翻页，最多 20 页 × 100 条，和网页一样。发送文字；整条内容如果正好是内置表情，会以 `type: sticker` 发送。
+- 消息列表按接口从旧到新翻页，最多 20 页 × 100 条，和网页一样。发送文字；整条内容如果正好是内置表情，会以 `type: sticker` 发送。发出的消息马上插进当前会话，不等下一次整段刷新。
 - 打开会话时用 `POST /v1/chats/{chatId}/read` 推进已读游标。每次用新的 `Idempotency-Key`，因为重复使用同一把钥匙不会覆盖后来的消息。
-- `GET /v1/events/stream`，带 `Accept: text/event-stream` 和 `Authorization: Bearer`。处理 `hello`、`resync`、`chat.message`。事件里只有 id，收到后再走 REST。重连带 `Last-Event-ID`。另外每 45 秒拉一次好友和当前会话，防止丢帧。
+- `GET /v1/events/stream`，带 `Accept: text/event-stream` 和 `Authorization: Bearer`。处理 `hello`、`resync`、`chat.message`。事件里只有 id。打开的会话收到 `chat.message` 后从最新一页往后补，不再每次重走整段历史；`hello` 和 `resync` 才重拉整段。重连带 `Last-Event-ID`。另外每 45 秒拉一次好友，并给已经打开的会话补一次最新消息，防止丢帧。
 - 别人发来消息、而你不在那个会话里时，可以弹本地通知。需要在「我的」里打开。
 - `GET /v1/me`、`PATCH /v1/me` 改昵称，`PUT /v1/me/avatar` 上传头像。头像是单独的 JPEG：客户端先裁成 720×720，服务端还会再裁一次。展示用公开的 `GET /v1/users/{userId}/avatar`，不带头，404 时用色块首字。
 
