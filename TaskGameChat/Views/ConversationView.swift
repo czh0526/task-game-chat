@@ -4,27 +4,24 @@ struct ConversationView: View {
     @Environment(AppModel.self) private var app
     var chatId: String
 
-    @State private var chat: Chat?
-    @State private var messages: [Message] = []
-    @State private var truncated = false
     @State private var draft = ""
     @State private var stickersOpen = false
     @State private var notice: String?
-    @State private var loading = true
     @State private var sending = false
-    @State private var loadTask: Task<Void, Never>?
-    @State private var loadGeneration = 0
-    @State private var historyReady = false
-    @State private var tailCursor: String?
-    @State private var tailFollowUp = false
-    @State private var pendingTailRead = false
 
-    private enum LoadKind {
-        case full
-        case tail
+    private var showsThisChat: Bool { app.liveChatID == chatId }
+    private var messages: [Message] { showsThisChat ? app.liveMessages : [] }
+    private var chat: Chat? { showsThisChat ? app.liveChat : nil }
+    private var loading: Bool { !showsThisChat || app.liveLoading }
+    private var truncated: Bool { showsThisChat && app.liveTruncated }
+    private var banner: String? {
+        if let notice, !notice.isEmpty { return notice }
+        guard showsThisChat, let live = app.liveNotice, !live.isEmpty else { return nil }
+        return live
     }
 
     var body: some View {
+        let tailID = messages.last?.id
         VStack(spacing: 0) {
             ScrollViewReader { proxy in
                 ScrollView {
@@ -56,7 +53,7 @@ struct ConversationView: View {
                     .padding(.vertical, 8)
                 }
                 .defaultScrollAnchor(.bottom)
-                .onChange(of: messages.last?.id) { _, id in
+                .onChange(of: tailID) { _, id in
                     guard let id else { return }
                     withAnimation { proxy.scrollTo(id, anchor: .bottom) }
                     Task { @MainActor in
@@ -81,46 +78,16 @@ struct ConversationView: View {
                 }
             }
             ToolbarItem(placement: .topBarTrailing) {
-                Button("刷新") { schedule(.full, markRead: app.sceneIsActive) }
+                Button("刷新") { app.refreshLiveConversation() }
             }
         }
         .safeAreaInset(edge: .top) {
-            if let notice {
-                NoticeBanner(message: notice).padding(.horizontal)
+            if let banner {
+                NoticeBanner(message: banner).padding(.horizontal)
             }
         }
-        .onAppear { app.openChatID = chatId }
-        .task {
-            app.openChatID = chatId
-            if historyReady {
-                schedule(.tail, markRead: true)
-            } else {
-                schedule(.full, markRead: true)
-            }
-        }
-        .onDisappear {
-            if app.openChatID == chatId { app.openChatID = nil }
-            loadTask?.cancel()
-        }
-        .onChange(of: app.eventGeneration) { _, _ in
-            guard let signal = app.lastSignal else { return }
-            if signal.type == "chat.message" {
-                if signal.chatId == chatId {
-                    schedule(.tail, markRead: app.sceneIsActive)
-                }
-                return
-            }
-            if signal.type == "resync" || signal.type == "hello" || signal.chatId == nil {
-                schedule(.full, markRead: app.sceneIsActive)
-            }
-        }
-        .onChange(of: app.refreshGeneration) { _, _ in
-            if historyReady {
-                schedule(.tail, markRead: app.sceneIsActive)
-            } else {
-                schedule(.full, markRead: app.sceneIsActive)
-            }
-        }
+        .onAppear { app.activateConversation(chatId) }
+        .onDisappear { app.deactivateConversation(chatId) }
     }
 
     private var title: String {
@@ -245,155 +212,15 @@ struct ConversationView: View {
         guard !body.isEmpty, !sending else { return }
         sending = true
         notice = nil
-        let localID = "\(MessageLog.localPrefix)\(UUID().uuidString)"
-        let pending = Message(
-            id: localID,
-            chatId: chatId,
-            senderId: app.user?.id ?? "",
-            type: type,
-            text: body,
-            attachmentRef: "",
-            createdAt: ChatTime.stamp(Date())
-        )
-        messages = MessageLog.upserting([pending], into: messages)
         let previousDraft = draft
-        let previousPreview = app.knownChats.first { $0.id == chatId }?.preview
         draft = ""
         stickersOpen = false
-        noteLastMessage()
         defer { sending = false }
-        do {
-            let message = try await app.client().postMessage(chatId: chatId, type: type, text: body)
-            messages = MessageLog.replacing(localID: localID, with: message, in: messages)
-            noteLastMessage()
-        } catch {
-            messages.removeAll { $0.id == localID }
+        if let error = await app.sendLiveMessage(chatId: chatId, type: type, text: body) {
             if draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 draft = previousDraft.isEmpty ? body : previousDraft
             }
-            if messages.isEmpty {
-                app.notePreview(chatId: chatId, text: previousPreview ?? "")
-            } else {
-                noteLastMessage()
-            }
-            app.expireIfNeeded(error)
-            notice = APIErrorText.describe(error, baseURL: app.baseURL)
+            notice = error
         }
-    }
-
-    private func schedule(_ kind: LoadKind, markRead: Bool) {
-        if kind == .tail, !historyReady {
-            tailFollowUp = true
-            if markRead { pendingTailRead = true }
-            return
-        }
-        if kind == .tail {
-            tailFollowUp = false
-            pendingTailRead = false
-        }
-        loadTask?.cancel()
-        loadGeneration &+= 1
-        let generation = loadGeneration
-        loadTask = Task { await run(kind, generation: generation, markRead: markRead) }
-    }
-
-    private func run(_ kind: LoadKind, generation: Int, markRead: Bool) async {
-        switch kind {
-        case .full:
-            await reload(generation: generation, markRead: markRead)
-        case .tail:
-            await syncTail(generation: generation, markRead: markRead)
-        }
-    }
-
-    private func isCurrent(_ generation: Int) -> Bool {
-        generation == loadGeneration && !Task.isCancelled
-    }
-
-    /// First open, manual refresh, hello, and resync. Later signals only re-read the newest page.
-    private func reload(generation: Int, markRead: Bool) async {
-        guard let client = try? app.client() else { return }
-        do {
-            let meta = try await client.getChat(id: chatId)
-            let history = try await client.messageHistory(chatId: chatId)
-            guard isCurrent(generation) else { return }
-            chat = meta
-            messages = MessageLog.applying(snapshot: history.messages, keeping: messages)
-            truncated = history.truncated
-            tailCursor = history.tailCursor
-            historyReady = true
-            loading = false
-            await app.hydrateNicknames(meta.memberIds + messages.map(\.senderId))
-            guard isCurrent(generation) else { return }
-            noteLastMessage()
-            if markRead {
-                try await acknowledgeRead(client)
-            }
-            guard isCurrent(generation) else { return }
-            if tailFollowUp {
-                let read = pendingTailRead || markRead
-                tailFollowUp = false
-                pendingTailRead = false
-                schedule(.tail, markRead: read)
-            }
-        } catch {
-            guard isCurrent(generation), !APIErrorText.isCancellation(error) else { return }
-            loading = false
-            app.expireIfNeeded(error)
-            notice = APIErrorText.describe(error, baseURL: app.baseURL)
-        }
-    }
-
-    /// One newest page, then any overflow. This is the path for `chat.message` and the 45s fallback.
-    private func syncTail(generation: Int, markRead: Bool) async {
-        guard let client = try? app.client() else { return }
-        do {
-            var cursor = tailCursor
-            var pages = 0
-            while pages < 20 {
-                let list = try await client.listMessages(chatId: chatId, limit: 100, cursor: cursor)
-                guard isCurrent(generation) else { return }
-                messages = MessageLog.upserting(list.items, into: messages)
-                let next = list.nextCursor
-                tailCursor = MessageCursor.resume(requested: cursor, next: next)
-                if let next, !next.isEmpty {
-                    cursor = next
-                    pages += 1
-                    if pages == 20 {
-                        truncated = true
-                        break
-                    }
-                    continue
-                }
-                truncated = false
-                break
-            }
-            guard isCurrent(generation) else { return }
-            loading = false
-            await app.hydrateNicknames(messages.map(\.senderId))
-            guard isCurrent(generation) else { return }
-            noteLastMessage()
-            guard markRead else { return }
-            try await acknowledgeRead(client)
-        } catch {
-            guard isCurrent(generation), !APIErrorText.isCancellation(error) else { return }
-            loading = false
-            app.expireIfNeeded(error)
-            notice = APIErrorText.describe(error, baseURL: app.baseURL)
-        }
-    }
-
-    private func acknowledgeRead(_ client: APIClient) async throws {
-        guard app.sceneIsActive else { return }
-        let through = messages.last(where: { !MessageLog.isLocal($0.id) })?.id
-        _ = try await client.markRead(chatId: chatId, messageId: through)
-        guard !Task.isCancelled else { return }
-        app.noteRead(chatId: chatId)
-    }
-
-    private func noteLastMessage() {
-        guard let last = messages.last else { return }
-        let preview = last.type == "sticker" ? Stickers.label(for: last.text) : (last.text.isEmpty ? last.attachmentRef : last.text)
-        app.notePreview(chatId: chatId, text: preview)
     }
 }
