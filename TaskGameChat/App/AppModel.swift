@@ -34,6 +34,13 @@ final class AppModel {
     var streamPhase: StreamPhase = .idle
     var statusBanner: String?
     var openChatID: String?
+    /// Transcript of the conversation the panel is showing. The view reads this directly.
+    var liveChatID: String?
+    var liveMessages: [Message] = []
+    var liveChat: Chat?
+    var liveTruncated = false
+    var liveLoading = false
+    var liveNotice: String?
     var pendingChatID: String?
     var selectedTab = 0
     var sceneIsActive = true
@@ -47,6 +54,11 @@ final class AppModel {
     private var streamBound = false
     private var seenMessageIDs: [String] = []
     private var pollTask: Task<Void, Never>?
+    private var liveTailCursor: String?
+    private var liveHistoryReady = false
+    private var liveTailFollowUp = false
+    private var liveGeneration = 0
+    private var liveTask: Task<Void, Never>?
     private let stream = EventStream()
     private let defaults = UserDefaults.standard
 
@@ -101,6 +113,7 @@ final class AppModel {
         knownChats = []
         nicknames = [:]
         openChatID = nil
+        clearLiveTranscript()
         pendingChatID = nil
         streamPhase = .idle
         statusBanner = nil
@@ -415,6 +428,9 @@ final class AppModel {
     private func fallbackRefresh() async {
         guard user != nil, sceneIsActive else { return }
         await refreshSocial()
+        if liveChatID != nil {
+            startLiveLoad(full: false)
+        }
         refreshGeneration &+= 1
     }
 
@@ -499,10 +515,15 @@ final class AppModel {
         eventGeneration &+= 1
         switch signal.type {
         case "chat.message":
+            if signal.chatId == liveChatID, signal.chatId?.isEmpty == false {
+                startLiveLoad(full: false)
+            }
             Task { await handleIncoming(signal) }
         case "hello":
+            if liveChatID != nil { startLiveLoad(full: true) }
             Task { await refreshSocial() }
         case "resync":
+            if liveChatID != nil { startLiveLoad(full: true) }
             Task {
                 await refreshSocial()
                 refreshGeneration &+= 1
@@ -510,6 +531,195 @@ final class AppModel {
         default:
             break
         }
+    }
+
+    func activateConversation(_ chatId: String) {
+        openChatID = chatId
+        guard liveChatID != chatId else {
+            if liveHistoryReady { startLiveLoad(full: false) }
+            return
+        }
+        liveTask?.cancel()
+        liveChatID = chatId
+        liveMessages = []
+        liveChat = nil
+        liveTruncated = false
+        liveLoading = true
+        liveNotice = nil
+        liveTailCursor = nil
+        liveHistoryReady = false
+        liveTailFollowUp = false
+        startLiveLoad(full: true)
+    }
+
+    func deactivateConversation(_ chatId: String) {
+        if openChatID == chatId { openChatID = nil }
+    }
+
+    func refreshLiveConversation() {
+        guard liveChatID != nil else { return }
+        startLiveLoad(full: true)
+    }
+
+    func sendLiveMessage(chatId: String, type: String, text: String) async -> String? {
+        let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !body.isEmpty else { return nil }
+        let localID = "\(MessageLog.localPrefix)\(UUID().uuidString)"
+        if liveChatID == chatId {
+            let pending = Message(
+                id: localID,
+                chatId: chatId,
+                senderId: user?.id ?? "",
+                type: type,
+                text: body,
+                attachmentRef: "",
+                createdAt: ChatTime.stamp(Date())
+            )
+            liveMessages = MessageLog.upserting([pending], into: liveMessages)
+        }
+        let preview = type == "sticker" ? Stickers.label(for: body) : body
+        let previousPreview = knownChats.first { $0.id == chatId }?.preview
+        notePreview(chatId: chatId, text: preview)
+        do {
+            let message = try await client().postMessage(chatId: chatId, type: type, text: body)
+            guard liveChatID == chatId else { return nil }
+            liveMessages = MessageLog.replacing(localID: localID, with: message, in: liveMessages)
+            notePreview(chatId: chatId, text: preview)
+            return nil
+        } catch {
+            if liveChatID == chatId {
+                liveMessages.removeAll { $0.id == localID }
+                if liveMessages.isEmpty {
+                    notePreview(chatId: chatId, text: previousPreview ?? "")
+                } else {
+                    noteLivePreview()
+                }
+            }
+            expireIfNeeded(error)
+            let text = APIErrorText.describe(error, baseURL: baseURL)
+            return text.isEmpty ? "发送失败。" : text
+        }
+    }
+
+    private func clearLiveTranscript() {
+        liveTask?.cancel()
+        liveTask = nil
+        liveChatID = nil
+        liveMessages = []
+        liveChat = nil
+        liveTruncated = false
+        liveLoading = false
+        liveNotice = nil
+        liveTailCursor = nil
+        liveHistoryReady = false
+        liveTailFollowUp = false
+    }
+
+    private func startLiveLoad(full: Bool) {
+        if !full, !liveHistoryReady {
+            liveTailFollowUp = true
+            return
+        }
+        liveGeneration &+= 1
+        let generation = liveGeneration
+        let markRead = sceneIsActive && openChatID != nil && openChatID == liveChatID
+        liveTask?.cancel()
+        liveTask = Task { [weak self] in
+            if full {
+                await self?.reloadLive(generation: generation, markRead: markRead)
+            } else {
+                await self?.syncLiveTail(generation: generation, markRead: markRead)
+            }
+        }
+    }
+
+    private func isLiveCurrent(_ generation: Int) -> Bool {
+        generation == liveGeneration && !Task.isCancelled && liveChatID != nil
+    }
+
+    private func reloadLive(generation: Int, markRead: Bool) async {
+        guard let chatId = liveChatID, let client = try? client() else { return }
+        do {
+            let meta = try await client.getChat(id: chatId)
+            let history = try await client.messageHistory(chatId: chatId)
+            guard isLiveCurrent(generation), liveChatID == chatId else { return }
+            liveChat = meta
+            liveMessages = MessageLog.applying(snapshot: history.messages, keeping: liveMessages)
+            liveTruncated = history.truncated
+            liveTailCursor = history.tailCursor
+            liveHistoryReady = true
+            liveLoading = false
+            liveNotice = nil
+            await hydrateNicknames(meta.memberIds + liveMessages.map(\.senderId))
+            guard isLiveCurrent(generation), liveChatID == chatId else { return }
+            noteLivePreview()
+            if markRead {
+                try await acknowledgeLiveRead(client, chatId: chatId)
+            }
+            guard isLiveCurrent(generation), liveChatID == chatId else { return }
+            if liveTailFollowUp {
+                liveTailFollowUp = false
+                startLiveLoad(full: false)
+            }
+        } catch {
+            guard isLiveCurrent(generation), liveChatID == chatId, !APIErrorText.isCancellation(error) else { return }
+            liveLoading = false
+            expireIfNeeded(error)
+            liveNotice = APIErrorText.describe(error, baseURL: baseURL)
+        }
+    }
+
+    private func syncLiveTail(generation: Int, markRead: Bool) async {
+        guard let chatId = liveChatID, let client = try? client() else { return }
+        do {
+            var cursor = liveTailCursor
+            var pages = 0
+            while pages < 20 {
+                let list = try await client.listMessages(chatId: chatId, limit: 100, cursor: cursor)
+                guard isLiveCurrent(generation), liveChatID == chatId else { return }
+                liveMessages = MessageLog.upserting(list.items, into: liveMessages)
+                let next = list.nextCursor
+                liveTailCursor = MessageCursor.resume(requested: cursor, next: next)
+                if let next, !next.isEmpty {
+                    cursor = next
+                    pages += 1
+                    if pages == 20 {
+                        liveTruncated = true
+                        break
+                    }
+                    continue
+                }
+                liveTruncated = false
+                break
+            }
+            guard isLiveCurrent(generation), liveChatID == chatId else { return }
+            liveLoading = false
+            liveNotice = nil
+            await hydrateNicknames(liveMessages.map(\.senderId))
+            guard isLiveCurrent(generation), liveChatID == chatId else { return }
+            noteLivePreview()
+            guard markRead else { return }
+            try await acknowledgeLiveRead(client, chatId: chatId)
+        } catch {
+            guard isLiveCurrent(generation), liveChatID == chatId, !APIErrorText.isCancellation(error) else { return }
+            liveLoading = false
+            expireIfNeeded(error)
+            liveNotice = APIErrorText.describe(error, baseURL: baseURL)
+        }
+    }
+
+    private func acknowledgeLiveRead(_ client: APIClient, chatId: String) async throws {
+        guard sceneIsActive, openChatID == chatId else { return }
+        let through = liveMessages.last(where: { !MessageLog.isLocal($0.id) })?.id
+        _ = try await client.markRead(chatId: chatId, messageId: through)
+        guard !Task.isCancelled, liveChatID == chatId else { return }
+        noteRead(chatId: chatId)
+    }
+
+    private func noteLivePreview() {
+        guard let chatId = liveChatID, let last = liveMessages.last else { return }
+        let preview = last.type == "sticker" ? Stickers.label(for: last.text) : (last.text.isEmpty ? last.attachmentRef : last.text)
+        notePreview(chatId: chatId, text: preview)
     }
 
     private func handleIncoming(_ signal: StreamSignal) async {
